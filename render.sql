@@ -152,18 +152,6 @@ CREATE OR REPLACE FUNCTION create_svgpath(d TEXT, width int, color bytea)
     END;
 $$ LANGUAGE plpgsql IMMUTABLE STRICT;
 
--- this function sucks but let's prototype this mofo out
-CREATE OR REPLACE FUNCTION bezier_points(p0 point, pc point, p1 point)
-    RETURNS SETOF point
-    AS $$
-    BEGIN
-    RETURN QUERY SELECT point(x, y) FROM (SELECT DISTINCT
-        round((1 - t.v) * (1 - t.v) * p0[0] + 2 * (1 - t.v) * t.v * pc[0] + t.v * t.v * p1[0]) as x,
-        round((1 - t.v) * (1 - t.v) * p0[1] + 2 * (1 - t.v) * t.v * pc[1] + t.v * t.v * p1[1]) as y
-    FROM (SELECT x::decimal / 100. as v FROM generate_series(0, 100) as x) as t) _;
-    END;
-$$ LANGUAGE plpgsql IMMUTABLE STRICT;
-
 CREATE OR REPLACE FUNCTION svgpath_contains(svgpath, point)
     RETURNS bool
     AS $$
@@ -173,17 +161,155 @@ CREATE OR REPLACE FUNCTION svgpath_contains(svgpath, point)
             FROM unnest(($1).steps) step
             WHERE (
                 SELECT CASE (step).svg_command
-                    WHEN 'Q' THEN EXISTS (
-                        SELECT 1
-                        FROM bezier_points((step).args[1], (step).args[2], (step).args[3]) _(p)
-                        WHERE circle (p, ($1).width) @> $2
-                    )
+                    WHEN 'Q' THEN
+                        qbezier_distance($2, (step).args[1], (step).args[2], (step).args[3]) <= ($1).width
                     WHEN 'L' THEN $2 <-> lseg((step).args[1], (step).args[2]) <= ($1).width
                 END
             )
         );
     END;
 $$ LANGUAGE plpgsql IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION qbezier_distance(p point, p0 point, pc point, p1 point)
+    RETURNS decimal
+    AS $$
+    DECLARE
+        pos_x decimal;
+        pos_y decimal;
+        a_x decimal;
+        a_y decimal;
+        b_x decimal;
+        b_y decimal;
+        a decimal;
+        b decimal;
+        c decimal;
+        d decimal;
+        solutions decimal[];
+        distMin decimal;
+        d0 decimal;
+        d1 decimal;
+    BEGIN
+        a_x := pc[0] - p0[0];
+        a_y := pc[1] - p0[1];
+        b_x := p0[0] - 2 * pc[0] + p1[0];
+        b_y := p0[1] - 2 * pc[1] + p1[1];
+
+        pos_x := p0[0] - p[0];
+        pos_y := p0[1] - p[1];
+        a := b_x * b_x + b_y * b_y;
+        b := 3 * (a_x * b_x + a_y * b_y);
+        c := 2 * (a_x * a_x + a_y * a_y) + pos_x * b_x + pos_y * b_y;
+        d := pos_x * a_x + pos_y * a_y;
+        solutions := third_degree_equation(a, b, c, d);
+
+        CASE WHEN solutions IS NOT NULL THEN
+            distMin := (
+                SELECT min(pt <-> p)
+                FROM (
+                    SELECT bezier_point(t, p0, pc, p1) as pt FROM unnest(solutions) _(t)
+                    WHERE t >= 0 AND t <= 1
+                ) _(pt)
+            );
+        ELSE NULL;
+        END CASE;
+
+        CASE WHEN distMin IS NULL THEN
+            d0 := p0 <-> p;
+            d1 := p1 <-> p;
+            CASE WHEN d0 < d1 THEN distMin := d0; ELSE distMin := d1; END CASE;
+        ELSE NULL;
+        END CASE;
+        RETURN distMin;
+    END;
+$$ LANGUAGE plpgsql IMMUTABLE STRICT;
+COMMENT ON FUNCTION qbezier_distance(point, point, point, point) IS
+    'Find the distance from a point to a quadratic bezier curve.
+
+    Adapted from http://blog.gludion.com/2009/08/distance-to-quadratic-bezier-curve.html';
+
+CREATE OR REPLACE FUNCTION third_degree_equation(a decimal, b decimal, c decimal, d decimal)
+    RETURNS decimal[]
+    AS $$
+    DECLARE
+        ε decimal := 0.0000001;
+        z decimal;  -- register, god help me
+        p decimal;
+        q decimal;
+        p3 decimal;
+        D2 decimal;
+        offs decimal;
+        u decimal;
+        v decimal;
+    BEGIN
+        CASE WHEN abs(a) > ε THEN
+            z := a;
+            a := b / z;
+            b := c / z;
+            c := d / z;
+            p := b - a * a / 3;
+            q := a * (2 * a * a - 9 * b) / 27 + c;
+            p3 := p * p * p;
+            D2 := q * q + 4 * p3 / 27;
+            offs := -a / 3;
+            CASE WHEN D2 > ε THEN
+                z := SQRT(D2);
+                u := (-q + z) / 2;
+                v := (-q - z) / 2;
+                CASE WHEN u >= 0 THEN u := power(u, 1./3); ELSE u := -power(-u, 1./3); END CASE;
+                CASE WHEN v >= 0 THEN v := power(v, 1./3); ELSE v := -power(-v, 1./3); END CASE;
+                RETURN ARRAY [u + v + offs];
+            WHEN D2 < -ε THEN
+                u := 2 * SQRT(-p / 3);
+                v := ACOS(-SQRT(-27 / p3) * q / 2) / 3;
+                RETURN ARRAY [
+                    u * COS(v) + offs,
+                    u * COS(v + 2 * PI() / 3) + offs,
+                    u * COS(v + 4 * PI() / 3) + offs
+                ];
+            ELSE
+                CASE WHEN q < 0 THEN u := power(-q / 2, 1./3); ELSE u := -power(q / 2, 1./3); END CASE;
+                RETURN ARRAY [2 * u + offs, -u + offs];
+            END CASE;
+        ELSE
+            a := b;
+            b := c;
+            c := d;
+            CASE WHEN abs(a) <= ε THEN
+                CASE WHEN abs(b) <= ε THEN RETURN NULL;
+                ELSE
+                    RETURN ARRAY [-c / b];
+                END CASE;
+            END CASE;
+            D2 := b * b - 4 * a * c;
+            CASE WHEN D2 < -ε THEN RETURN NULL;
+            WHEN D2 >= ε THEN
+                D2 := SQRT(D2);
+                RETURN ARRAY [
+                    (-b - D2) / (2 * a),
+                    (-b + D2) / (2 * a)
+                ];
+            ELSE RETURN ARRAY [-b / (2 * a)];
+            END CASE;
+        END CASE;
+    END;
+$$ LANGUAGE plpgsql IMMUTABLE STRICT;
+COMMENT ON FUNCTION third_degree_equation(decimal, decimal, decimal, decimal) IS
+    'Find the solutions to the cubic function `ax3 + bx2 + cx + d = 0`
+
+    Adapted from http://blog.gludion.com/2009/08/distance-to-quadratic-bezier-curve.html';
+
+
+CREATE OR REPLACE FUNCTION bezier_point(t decimal, p0 point, pc point, p1 point)
+    RETURNS point
+    AS $$
+    BEGIN
+        RETURN point (
+            round((1 - t) * (1 - t) * p0[0] + 2 * (1 - t) * t * pc[0] + t * t * p1[0]),
+            round((1 - t) * (1 - t) * p0[1] + 2 * (1 - t) * t * pc[1] + t * t * p1[1])
+        );
+    END;
+$$ LANGUAGE plpgsql IMMUTABLE STRICT;
+
 
 CREATE OPERATOR @> (
     leftarg = svgpath,
