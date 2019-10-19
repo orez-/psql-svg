@@ -152,6 +152,64 @@ CREATE OR REPLACE FUNCTION create_svgpath(d TEXT, width int, color bytea)
     END;
 $$ LANGUAGE plpgsql IMMUTABLE STRICT;
 
+CREATE OR REPLACE FUNCTION left_of(p point, p0 point, p1 point)
+    RETURNS bool
+    AS $$
+    BEGIN
+        RETURN (p[0] - p0[0]) * (p1[1] - p0[1]) - (p[1] - p0[1]) * (p1[0] - p0[0]) < 0;
+    END;
+$$ LANGUAGE plpgsql IMMUTABLE STRICT;
+
+
+CREATE OR REPLACE FUNCTION unit(point)
+    RETURNS point
+    AS $$
+    DECLARE magnitude decimal;
+    BEGIN
+        magnitude := sqrt($1[0] * $1[0] + $1[1] * $1[1]);
+        RETURN point ($1[0] / magnitude, $1[1] / magnitude);
+    END;
+$$ LANGUAGE plpgsql IMMUTABLE STRICT;
+
+
+CREATE OR REPLACE FUNCTION expand_triangle(p0 point, p1 point, p2 point, amount decimal)
+    RETURNS RECORD
+    AS $$
+    DECLARE
+        leg0 point;
+        leg1 point;
+        leg2 point;
+        ret RECORD;
+    BEGIN
+        leg0 := unit (p0 - p1) * point (amount, 0);
+        leg1 := unit (p1 - p2) * point (amount, 0);
+        leg2 := unit (p2 - p0) * point (amount, 0);
+        SELECT
+            p0 + leg0 - leg2,
+            p1 + leg1 - leg0,
+            p2 + leg2 - leg1
+        INTO ret;
+        RETURN ret;
+    END;
+$$ LANGUAGE plpgsql IMMUTABLE STRICT;
+COMMENT ON FUNCTION expand_triangle(point, point, point, decimal) IS
+    'Expand the edges of the triangle defined by the points out by `amount`.
+     The expansion happens perpendicular away from the edges, meaning the vertices
+     will expand more than `amount` away from the center.';
+
+
+CREATE OR REPLACE FUNCTION dist2(point, point)
+    RETURNS decimal
+    AS $$
+    BEGIN
+        RETURN ($1[0] - $2[0]) * ($1[0] - $2[0]) + ($1[1] - $2[1]) * ($1[1] - $2[1]);
+    END;
+$$ LANGUAGE plpgsql IMMUTABLE STRICT;
+COMMENT ON FUNCTION dist2(point, point) IS
+    'Distance formula for two 2d points, but skipping the final sqrt.
+     This can be a nice optimization when you just need to compare relative lengths';
+
+
 CREATE OR REPLACE FUNCTION svgpath_contains(svgpath, point)
     RETURNS bool
     AS $$
@@ -162,7 +220,15 @@ CREATE OR REPLACE FUNCTION svgpath_contains(svgpath, point)
             WHERE (
                 SELECT CASE (step).svg_command
                     WHEN 'Q' THEN
-                        qbezier_distance($2, (step).args[1], (step).args[2], (step).args[3]) <= ($1).width
+                        (
+                            SELECT count(*) = 1 FROM (
+                                SELECT 1
+                                FROM expand_triangle((step).args[1], (step).args[2], (step).args[3], ($1).width)
+                                AS (p0 point, p1 point, p2 point)
+                                JOIN LATERAL (VALUES (p0, p1), (p1, p2), (p2, p0)) _(pa, pb) ON TRUE
+                                GROUP BY left_of($2, pa, pb)
+                            ) _
+                        ) AND qbezier_distance($2, (step).args[1], (step).args[2], (step).args[3]) <= ($1).width
                     WHEN 'L' THEN $2 <-> lseg((step).args[1], (step).args[2]) <= ($1).width
                 END
             )
@@ -255,8 +321,8 @@ CREATE OR REPLACE FUNCTION third_degree_equation(a decimal, b decimal, c decimal
                 z := SQRT(D2);
                 u := (-q + z) / 2;
                 v := (-q - z) / 2;
-                CASE WHEN u >= 0 THEN u := power(u, 1./3); ELSE u := -power(-u, 1./3); END CASE;
-                CASE WHEN v >= 0 THEN v := power(v, 1./3); ELSE v := -power(-v, 1./3); END CASE;
+                CASE WHEN u >= 0 THEN u := cbrt(u); ELSE u := -cbrt(-u); END CASE;
+                CASE WHEN v >= 0 THEN v := cbrt(v); ELSE v := -cbrt(-v); END CASE;
                 RETURN ARRAY [u + v + offs];
             WHEN D2 < -ε THEN
                 u := 2 * SQRT(-p / 3);
@@ -267,7 +333,7 @@ CREATE OR REPLACE FUNCTION third_degree_equation(a decimal, b decimal, c decimal
                     u * COS(v + 4 * PI() / 3) + offs
                 ];
             ELSE
-                CASE WHEN q < 0 THEN u := power(-q / 2, 1./3); ELSE u := -power(q / 2, 1./3); END CASE;
+                CASE WHEN q < 0 THEN u := cbrt(-q / 2); ELSE u := -cbrt(q / 2); END CASE;
                 RETURN ARRAY [2 * u + offs, -u + offs];
             END CASE;
         ELSE
