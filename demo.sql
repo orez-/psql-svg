@@ -1,3 +1,5 @@
+SET SESSION SCHEMA 'ppm';
+
 -- === QUADRATIC BEZIER CURVE ===
 -- SELECT encode(to_ppm(
 --     450, 400,

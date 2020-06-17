@@ -1,3 +1,21 @@
+CREATE SCHEMA ppm;
+
+SET SESSION SCHEMA 'ppm';
+
+-- https://wiki.postgresql.org/wiki/First/last_(aggregate)
+-- Create a function that always returns the first non-NULL item
+CREATE OR REPLACE FUNCTION first_agg ( anyelement, anyelement )
+RETURNS anyelement LANGUAGE SQL IMMUTABLE STRICT AS $$
+    SELECT $1;
+$$;
+
+-- And then wrap an aggregate around it
+CREATE AGGREGATE FIRST (
+    sfunc    = first_agg,
+    basetype = anyelement,
+    stype    = anyelement
+);
+
 CREATE TYPE render_shape AS (
     shape circle,
     color bytea
@@ -376,7 +394,6 @@ CREATE OR REPLACE FUNCTION bezier_point(t decimal, p0 point, pc point, p1 point)
     END;
 $$ LANGUAGE plpgsql IMMUTABLE STRICT;
 
-
 CREATE OPERATOR @> (
     leftarg = svgpath,
     rightarg = point,
@@ -408,11 +425,3 @@ BEGIN
         FROM unnest(shapes) shape WHERE shape @> point (x, y)
     ) _ ON true;
 END $$;
-
--- SELECT encode(to_ppm(
---     200, 400,
---     ARRAY[
---         (circle '<(100, 175) 100>', bytea '\x00FF00')::render_shape,
---         (circle '<(75, 75) 50>', bytea '\xFF0000')::render_shape
---     ]
--- ), 'base64');
